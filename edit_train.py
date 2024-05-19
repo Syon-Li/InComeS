@@ -82,7 +82,7 @@ def main():
                                           gist_activations=gist_activations, 
                                           gist_pool_idx=gist_pool_idx, 
                                           gist_token_ids=gist_token_ids,
-                                          use_cache=False
+                                          use_cache=False,
                                           )
         loss = outputs.loss
         print(loss)
