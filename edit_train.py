@@ -35,18 +35,10 @@ def main():
     # print(tokenizer.encode("This is an apple. That is a person."))
 
 
-    # prompt = ["Tiger is an animal. <GIST> Hey, are you conscious? Can you talk to me?", "Pig is a creature, but A is B. <GIST> How do you think about human rights?"]
-    # inputs = tokenizer(prompt, return_tensors="pt", padding=True).to("cuda")
-    # print(inputs)
-
     arr = np.memmap("/apdcephfs_qy3/share_733425/zhisonzhang/zh/2401mygo/data3/SlimPajama-100B-sample/slimPv0.T63.bin", dtype=np.uint16, mode='r')
     print(arr[:10], arr.shape, type(arr[:10]))
 
 
-
-    # Generate
-    # generate_ids = model.generate(inputs.input_ids, max_length=30)
-    # tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
     gist_activations = {}
     for i in range(model.config.num_hidden_layers):
