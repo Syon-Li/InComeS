@@ -113,9 +113,9 @@ class Edit_LlamaAttention(LlamaAttention):
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_value: Optional[Cache] = None,
-            gist_activations: Optional[Dict[int, Dict]] = None,
-            gist_idx_vector: Optional[torch.Tensor] = None,
-            gist_pool_idx: Optional[torch.Tensor] = None,
+            gist_activations: Optional[Dict[int, Dict]] = None, #[num_gist, num_key_value_head, head_dim]
+            gist_idx_vector: Optional[torch.Tensor] = None, #[bsz, q_len]
+            gist_pool_idx: Optional[torch.Tensor] = None, #[bsz, num_gist]
             extra_loss: Optional[Dict[str, List]] = None,
             loss_weights: Optional[Tuple] = None,
             output_attentions: bool = False,
@@ -159,27 +159,15 @@ class Edit_LlamaAttention(LlamaAttention):
 
 
             #updating new gist
-            # new_gist_keys = key_states[F.one_hot(gist_token_idxs, num_classes=q_len).to(torch.bool)]
-            # new_gist_values = value_states[F.one_hot(gist_token_idxs, num_classes=q_len).to(torch.bool)]
-            new_gist_keys = key_states.transpose(1,2)[gist_idx_vector].detach()
-            new_gist_values = value_states.transpose(1,2)[gist_idx_vector].detach()
-            gist_activations[self.layer_idx]["keys"] = torch.vstack([gist_activations[self.layer_idx]["keys"], new_gist_keys])
-            gist_activations[self.layer_idx]["values"] = torch.vstack([gist_activations[self.layer_idx]["values"], new_gist_values])
+            new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
+            new_gist_values = value_states.transpose(1,2)[gist_idx_vector]
+            gist_activations[self.layer_idx]["keys"] = torch.concat([gist_activations[self.layer_idx]["keys"], new_gist_keys])
+            gist_activations[self.layer_idx]["values"] = torch.concat([gist_activations[self.layer_idx]["values"], new_gist_values])
 
             #Gist activations
-            gist_keys = gist_activations[self.layer_idx]["keys"]
+            gist_keys = gist_activations[self.layer_idx]["keys"] # [num_gist,key_value_head,head_dim]
             gist_values = gist_activations[self.layer_idx]["values"]
             # print('gist_pool size', gist_keys.shape, gist_values.shape)
-            # num_gist_thresh = 20
-            # if gist_keys.shape[0] > num_gist_thresh:
-            #     gist_keys[:-num_gist_thresh] = gist_keys[:-num_gist_thresh].detach()
-            #     gist_values[:-num_gist_thresh] = gist_values[:-num_gist_thresh].detach()
-            bsz_gist_keys = torch.stack([gist_keys]*bsz, dim=0)
-            bsz_gist_values = torch.stack([gist_values]*bsz, dim=0)
-            bsz_gist_keys = bsz_gist_keys.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            bsz_gist_values = bsz_gist_values.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            # print(key_states.shape, gist_layer_activa.shape)
-
 
 
             if past_key_value is not None:
@@ -189,11 +177,13 @@ class Edit_LlamaAttention(LlamaAttention):
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-            bsz_gist_keys = repeat_kv(bsz_gist_keys, self.num_key_value_groups)
-            bsz_gist_values = repeat_kv(bsz_gist_values, self.num_key_value_groups)
+
+            gist_keys = gist_keys.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1)
+            gist_values = gist_values.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1)
+
 
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-            gist_weights = torch.matmul(query_states, bsz_gist_keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            gist_weights = torch.matmul(query_states, gist_keys.transpose(1, 2)) / math.sqrt(self.head_dim)
 
 
             if attention_mask is not None:  # no matter the length, we just slice it
@@ -211,32 +201,31 @@ class Edit_LlamaAttention(LlamaAttention):
             # Calculate gist token attention
             gist_weights = nn.functional.softmax(gist_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
-            gist_output = torch.matmul(gist_weights, bsz_gist_values)
+            gist_output = torch.matmul(gist_weights, gist_values)
             # print(attn_output.shape, gist_output.shape)
 
             
             sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights
+            #Decide what tokens are selected to combine with the gist information
+            q_len_index = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).reshape(-1, bsz)
             if self.training:
                 if p0_loss_w>0:
-                    p0_loss = -gist_weights[...,0].log().mean()
+                    # p0_loss = -gist_weights[...,0].log().mean()
+                    p0_loss = -F.log_softmax(gist_weights[...,0], dim=-1).sum(-1).mean()
                     extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w))
 
                 if pS_loss_w>0:
-                    q_len_index = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).reshape(-1, bsz)
-                    
                     mask = q_len_index.repeat_interleave(gist_weights.shape[-1], dim=1).reshape(bsz, q_len, -1) * gist_pool_idx.repeat_interleave(q_len, dim=0).reshape(bsz, q_len, -1)
                     # print(gist_pool_idx.repeat_interleave(q_len, dim=0).reshape(bsz, q_len, -1))
-                    mask = mask.repeat_interleave(self.num_heads, dim=1).reshape(gist_weights.shape)
-                    # print(mask, mask.shape)
-
-                    # pS_loss = -gist_weights[gist_weights_mask.transpose(2,3).to(torch.bool)].log().sum(dim=0).mean()
-                    # pS_loss = -gist_weights[gist_weights_mask.transpose(2,3).to(torch.bool)].log().mean()
-                    pS_loss = -gist_weights[mask.to(torch.bool)].log().mean()
+                    mask[...,0] = True
+                    pS_loss_matrix = (-gist_weights.transpose(0,1) * mask[:,None,:,:].transpose(0,1)).transpose(0,1)
+                    pS_loss = -F.log_softmax(pS_loss_matrix, dim=-1).sum(-1).mean()
                     extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w))
 
                 if sparsity_loss_w>0:
                     #Entropy
-                    sparsity_loss = -(gist_weights * gist_weights.log()).sum(dim=-1).mean()
+                    # sparsity_loss = -(gist_weights * gist_weights.log()).sum(dim=-1).mean()
+                    sparsity_loss = -(gist_weights.softmax(dim=-1) * F.log_softmax(gist_weights, dim=-1)).sum(-1).mean()
                     extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w))
             
                 # print(sparsity_loss, p0_loss, pS_loss)
@@ -248,7 +237,8 @@ class Edit_LlamaAttention(LlamaAttention):
                     f" {attn_output.size()}"
                 )
 
-            attn_output += gist_output
+            # Only selected tokens are given gist information
+            attn_output.transpose(1,2)[q_len_index.reshape(bsz,-1)] += gist_output.transpose(1,2)[q_len_index.reshape(bsz,-1)]
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
@@ -425,15 +415,9 @@ class Edit_LlamaModel(LlamaModel):
         position_ids = alter_position_ids(gist_token_ids=gist_token_ids, input_ids=input_ids)
         # print(position_ids)
 
+        # print(attention_mask, inputs_embeds, cache_position, cache_position.shape, past_seen_tokens)
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
-        # print(causal_mask.shape)
-
-        # gist_mask = make_gist_mask(input_ids, gist_token=gist_token_ids, pad_token=2)
-        # causal_gist_mask = torch.where(gist_mask>0, causal_mask, torch.finfo(inputs_embeds.dtype).min)
-        # row_index = (gist_idx_vector.cumsum(-1) - 1) > 0
-        # mask1 = row_index.repeat_interleave(input_ids.shape[1], dim=0) * gist_idx_vector.repeat_interleave(input_ids.shape[1], dim=0)
-        # causal_gist_mask[mask1.reshape(causal_gist_mask.shape)] = torch.finfo(inputs_embeds.dtype).min
-        # print(causal_gist_mask)
+        # print("causal_mask:", causal_mask)
 
 
         col_index = (reverse_cumsum(reverse_cumsum(gist_idx_vector)) - 1 > 0)
@@ -442,17 +426,7 @@ class Edit_LlamaModel(LlamaModel):
         # print(row_index)
         mask1 = row_index.repeat_interleave(input_ids.shape[1], dim=1).reshape(causal_mask.shape) * col_index.repeat_interleave(input_ids.shape[1], dim=0).reshape(causal_mask.shape)
         causal_mask[mask1] = torch.finfo(inputs_embeds.dtype).min
-        # print(causal_mask, causal_mask.shape)
-
-        # try:
-        #     gist_mask = make_gist_mask(input_ids, gist_token=gist_token_ids, pad_token=2)
-        #     # print(gist_mask.shape)
-        #     # gist_mask = (gist_mask.eq(0)).to(inputs_embeds.dtype) * torch.finfo(inputs_embeds.dtype).min
-        #     causal_gist_mask = torch.where(gist_mask>0, causal_mask, torch.finfo(inputs_embeds.dtype).min)
-        #     causal_gist_mask[:, gist_idx_vector] = torch.finfo(inputs_embeds.dtype).min
-        #     print(causal_gist_mask)
-        # except:
-        #     causal_gist_mask = causal_mask
+        # print("modified casual_mask", causal_mask)
     
 
         # embed positions
@@ -543,7 +517,7 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
         gist_activations: Optional[Dict[int, torch.Tensor]] = None,
         gist_token_ids: Optional[int] = None,
         gist_pool_idx: Optional[torch.Tensor] = None,
-        # loss_weights: Optional[torch.Tensor] = None,
+        loss_weights: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -586,7 +560,6 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         extra_loss = {"sparsity_loss":[], "p0_loss":[], "pS_loss":[]}
-        loss_weights = (1,1,1)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs, gist_activations, extra_loss = self.model(
             input_ids=input_ids,
@@ -615,7 +588,7 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
             logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        loss = None
+        loss, loss_set = None, []
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -627,9 +600,14 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            print(loss)
             loss += torch.tensor(extra_loss["sparsity_loss"]).mean()
             loss += torch.tensor(extra_loss["p0_loss"]).mean()
             loss += torch.tensor(extra_loss["pS_loss"]).mean()
+            # loss_set.append(loss)
+            # loss_set.append(torch.tensor(extra_loss["sparsity_loss"]).mean())
+            # loss_set.append(torch.tensor(extra_loss["p0_loss"]).mean())
+            # loss_set.append(torch.tensor(extra_loss["pS_loss"]).mean())
 
         if not return_dict:
             output = (logits,) + outputs[1:]
