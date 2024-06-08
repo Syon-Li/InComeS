@@ -14,6 +14,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     apply_rotary_pos_emb,
     repeat_kv,
+    AttentionMaskConverter,
 )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -106,6 +107,9 @@ def alter_position_ids(gist_token_ids: int, input_ids: torch.Tensor):
 class Edit_LlamaAttention(LlamaAttention):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
+        self.zero_gist_key = nn.parameter.Parameter(data=torch.randn((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)))
+        self.zero_gist_value = nn.parameter.Parameter(data=torch.zeros((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)), requires_grad=False)
+
 
     def forward(
             self,
@@ -164,10 +168,10 @@ class Edit_LlamaAttention(LlamaAttention):
             gist_activations[self.layer_idx]["keys"] = torch.concat([gist_activations[self.layer_idx]["keys"], new_gist_keys])
             gist_activations[self.layer_idx]["values"] = torch.concat([gist_activations[self.layer_idx]["values"], new_gist_values])
 
-            #Gist activations
-            gist_keys = gist_activations[self.layer_idx]["keys"] # [num_gist,key_value_head,head_dim]
-            gist_values = gist_activations[self.layer_idx]["values"]
-            # print('gist_pool size', gist_keys.shape, gist_values.shape)
+            #Add zero gist key and value
+            gist_keys = torch.concat([self.zero_gist_key, gist_activations[self.layer_idx]["keys"]]) # [num_gist+1,key_value_head,head_dim]
+            gist_values = torch.concat([self.zero_gist_value, gist_activations[self.layer_idx]["values"]])
+            # print('gist key and value size', gist_keys.shape, gist_values.shape)
 
 
             if past_key_value is not None:
@@ -349,6 +353,86 @@ class Edit_LlamaModel(LlamaModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.layers = nn.ModuleList([Edit_LlamaDecoderLayer(config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)])
+
+    
+    # make sure the causal mask is always returned, since we will further make modification on it
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_seen_tokens: int,
+    ):
+        # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
+        # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
+        # (`recording cudagraph tree for symint key 13`, etc.), which is VERY slow. A workaround is `@torch.compiler.disable`, but this prevents using
+        # `fullgraph=True`. See more context in https://github.com/huggingface/transformers/pull/29114
+
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
+        # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        # using_static_cache = isinstance(past_key_values, StaticCache)
+
+        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        if self.config._attn_implementation == "sdpa":
+            # if AttentionMaskConverter._ignore_causal_mask_sdpa(
+            #     attention_mask,
+            #     inputs_embeds=input_tensor,
+            #     past_key_values_length=past_seen_tokens,
+            #     is_training=self.training,
+            # ):
+            #     return None
+            pass
+
+
+        dtype, device = input_tensor.dtype, input_tensor.device
+        min_dtype = torch.finfo(dtype).min
+        sequence_length = input_tensor.shape[1]
+        target_length = (
+            attention_mask.shape[-1]
+            if isinstance(attention_mask, torch.Tensor)
+            else past_seen_tokens + sequence_length + 1
+        )
+
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # in this case we assume that the mask comes already in inverted form and requires no inversion or slicing
+            if attention_mask.max() != 0:
+                raise ValueError("Custom 4D attention mask should be passed in inverted form with max==0`")
+            causal_mask = attention_mask
+        else:
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+        ):
+            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
+            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
+            # Details: https://github.com/pytorch/pytorch/issues/110213
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
+    
     
     def forward(
         self,
@@ -415,7 +499,7 @@ class Edit_LlamaModel(LlamaModel):
         position_ids = alter_position_ids(gist_token_ids=gist_token_ids, input_ids=input_ids)
         # print(position_ids)
 
-        # print(attention_mask, inputs_embeds, cache_position, cache_position.shape, past_seen_tokens)
+        # print("self.config._attn_implementation", self.config._attn_implementation)
         causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
         # print("causal_mask:", causal_mask)
 
@@ -588,7 +672,7 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
             logits = self.lm_head(hidden_states)
         logits = logits.float()
 
-        loss, loss_set = None, []
+        loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -620,4 +704,3 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         ), gist_activations
-    
