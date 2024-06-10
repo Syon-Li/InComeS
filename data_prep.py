@@ -5,6 +5,7 @@ import json
 import random
 import math
 import os
+import nltk
 
 
 def create_ffile():
@@ -44,11 +45,10 @@ def create_ffile():
 def main():
 
     parser = argparse.ArgumentParser(description='Process data.')
-    parser.add_argument('--mode', type=str, choices=["ffile", "tokenize"], help='the sample proportion')
-    parser.add_argument('--proportion', type=float, help='the sample proportion')
+    parser.add_argument('--mode', type=str, choices=["ffile", "tokenize"], default="ffile", help='the sample proportion')
+    parser.add_argument('--proportion', type=float, default=0.016, help='the sample proportion')
     parser.add_argument('--input_ffile', type=str, help='the name of the input file to process')
-    parser.add_argument('--output_file', type=str, help='the name of the output file')
-    parser.add_argument('--split', type=int, help='the number of split')
+    parser.add_argument('--split', type=int, default=200, help='the number of split')
     parser.add_argument('--split_i', type=int, help='the index of split')
     args = parser.parse_args()
 
@@ -65,7 +65,10 @@ def main():
         # print(tokenizer.additional_special_tokens, tokenizer.additional_special_tokens_ids)
         tokenizer.pad_token = tokenizer.eos_token
         gist_token_id = tokenizer.additional_special_tokens_ids[-1]
-        gist_loc_token_ids = tokenizer.convert_tokens_to_ids([".","!","?",":",";","..."])
+        # gist_loc_token_ids = tokenizer.convert_tokens_to_ids([".","!","?",":",";","..."])
+        gist_loc_token_ids = tokenizer.convert_tokens_to_ids(".")
+        Slices = [0, 256, 512, 1024]
+        
         
         dctx = zstd.ZstdDecompressor()
         interval = math.ceil(len(ffiles)/args.split)
@@ -77,7 +80,7 @@ def main():
 
                     split_data = data[:].decode('utf-8').split('\n')
                     # print(split_data)
-                    Slices = [0, 256, 512, 1024, 2048]
+                    
                     Buckets = []
                     for i in range(len(Slices)):
                         Buckets.append([])
@@ -85,18 +88,34 @@ def main():
                     for item in split_data:
                         if len(item)!=0:
                             item = json.loads(item)
+                            sents = nltk.tokenize.sent_tokenize(item['text'])
                             inputs = tokenizer(item['text'] + tokenizer.eos_token)
-                            gist_loc = -1
-                            for id in gist_loc_token_ids:
-                                try:
-                                    gist_loc = inputs["input_ids"].index(id)
+                            len_s = [0]
+                            for i,s in enumerate(sents):
+                                s_tokenized = tokenizer(s)
+                                len_s.append(len_s[-1]+len(s_tokenized["input_ids"]))
+                                if len_s[-1]>128:
                                     break
-                                except:
-                                    pass
-                            if gist_loc >= 0:
-                                inputs["input_ids"].insert(gist_loc+1, gist_token_id)
-                            else:
-                                inputs["input_ids"].insert(int(len(inputs["input_ids"])*0.1), gist_token_id)
+                                else:
+                                    if len_s[-1]>=16:
+                                        inputs["input_ids"].insert(len_s[-1]+1, gist_token_id)
+                                        break
+
+                            if gist_token_id not in inputs["input_ids"]:
+                                inputs["input_ids"].insert(len_s[-1]+1, gist_token_id)
+
+
+                            # gist_loc = -1
+                            # for id in gist_loc_token_ids:
+                            #     try:
+                            #         gist_loc = inputs["input_ids"].index(id)
+                            #         break
+                            #     except:
+                            #         pass
+                            # if gist_loc >= 0:
+                            #     inputs["input_ids"].insert(gist_loc+1, gist_token_id)
+                            # else:
+                            #     inputs["input_ids"].insert(int(len(inputs["input_ids"])*0.1), gist_token_id)
 
                             for i in range(1, len(Slices)):
                                 if len(inputs["input_ids"]) > Slices[i-1] and len(inputs["input_ids"]) <= Slices[i]:
