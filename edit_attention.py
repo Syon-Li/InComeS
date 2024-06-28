@@ -360,11 +360,11 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
 
 
             sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
-            eps = 1e-3
+            eps = 1e-5
             if self.training:
                 if p0_loss_w>0:
-                    p0_loss = gist_weights[...,0].sum(-1) + eps
-                    p0_loss = -p0_loss.log().mean()
+                    p0_loss = (gist_weights[...,0] + eps).log()
+                    p0_loss = -p0_loss.log() * atten_mask[:,None,:] / atten_mask[:,None,:].sum(-1)
 
                     extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w).item())
 
@@ -374,11 +374,9 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
                     mask[...,0] = 1
                     # print("mask", mask, mask.shape)
 
-                    # pS_loss = (gist_weights * mask[:,None,:,:]).sum(-1) + eps
-                    # pS_loss = -pS_loss.log().mean()
+                    pS_loss = (gist_weights * mask[:,None,:,:]).sum(-1) + eps
+                    pS_loss = -pS_loss.log() * atten_mask[:,None,:] / atten_mask[:,None,:].sum(-1)
 
-                    pS_loss = (gist_weights * mask[:,None,:,:]).sum(-2) + eps
-                    pS_loss = -pS_loss.log().mean()
 
                     extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w).item())
 
