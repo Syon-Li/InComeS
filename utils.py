@@ -1,6 +1,8 @@
 import torch
 import math
+import copy
 import json
+import random
 from typing import Tuple, Iterator, List
 import numpy as np
 
@@ -53,39 +55,77 @@ class ArrIterD(torch.utils.data.IterableDataset):
     
 
 
+
+
+
 class FileIterD(torch.utils.data.IterableDataset):
-    def __init__(self, lines, start, end, batch_size):
+    def __init__(self, f_path_set, start_set, end_set, batch_size):
         super(FileIterD).__init__()
-        self.lines = lines
-        self.start = start
-        self.end = end 
+        self.f_path_set = f_path_set
+        self.start_set = start_set
+        self.end_set = end_set
         self.batch_size = batch_size
     
     def __len__(self):
-        return (self.end - self.start)
+        leg = 0
+        for start, end in zip(self.start_set, self.end_set):
+            leg += (end - start)
+        return leg
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
+        # print(worker_info)
+        random.seed(126)
 
-        iter_start = self.start
-        iter_end = self.end
+        iter_start_set = self.start_set
+        iter_end_set = self.end_set
         if worker_info is not None:
-            per_worker = int(math.ceil((self.end-self.start) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            iter_start = worker_id * per_worker
-            iter_end = min(self.start + per_worker, self.end) 
-
-        input_ids = []
-        for i,line in enumerate(self.lines):
-            if i>=iter_start and i<iter_end:
-                py_dict = json.loads(line)
-                input_ids.append(py_dict["input_ids"])
+            iter_start_set, iter_end_set = [], []
+            for start, end in zip(self.start_set, self.end_set):
+                per_worker = int(math.ceil((end-start) / float(worker_info.num_workers)))
+                worker_id = worker_info.id
+                iter_start = worker_id * per_worker
+                iter_end = min(start + per_worker, end)
+                iter_start_set.append(iter_start)
+                iter_end_set.append(iter_end)
         
-        for i in range(iter_start, iter_end, self.batch_size):
-            yield input_ids[i:i+self.batch_size]
-        
+        f_objects = []
+        for i,f_path in enumerate(self.f_path_set):
+            f_objects.append(open(f_path, "r"))
 
-        # return iter(input_ids[iter_start:iter_end])
+        cnts = [0] * len(self.f_path_set)
+        for i,f in enumerate(f_objects):
+            for _ in range(iter_start_set[i]):
+                f.readline()
+                cnts[i] += 1
+        
+        f_idxs = list(range(len(self.f_path_set)))
+        batch = 0
+        while len(f_idxs)>0:
+            idx = random.sample(f_idxs,k=1)[0]
+            batch_r = min(cnts[idx]+self.batch_size[idx], iter_end_set[idx])
+            input_ids = []
+            cnt = 0
+            for _ in range(cnts[idx], batch_r):
+                line = f_objects[idx].readline()
+                if line.strip():
+                    py_dict = json.loads(line.strip())
+                    input_ids.append(py_dict["input_ids"])  
+                    cnt += 1              
+                else:
+                    f_idxs.remove(idx)
+                    break
+            cnts[idx] += cnt
+            if cnts[idx]+1 >= iter_end_set[idx]:
+                f_idxs.remove(idx)
+
+            yield batch,input_ids
+            batch += 1
+
+        for f in f_objects:
+            f.close()  
+                
+
 
 
 
@@ -141,9 +181,13 @@ def collate_fn_fileD(batch_data, pad_id=2, gist_token_ids=32000):
     # print(len(batch_data), len(batch_data[0]))
     
     input_ids, attention_masks, labels = [], [], []
-    for batch in batch_data:
+    for i,batch in batch_data:
         max_length = find_max_length(batch)
         for data in batch:
+            # if gist_token_ids in data:
+            #     gist_loc = data.index(gist_token_ids)
+            # else:
+            #     gist_loc = len(data)
             gist_loc = data.index(gist_token_ids)
             difference = max_length - len(data)
             attention_mask = torch.zeros(max_length)
@@ -154,4 +198,29 @@ def collate_fn_fileD(batch_data, pad_id=2, gist_token_ids=32000):
             attention_masks.append(attention_mask.tolist())
             labels.append(label)
 
-    return (torch.tensor(input_ids), torch.tensor(attention_masks), torch.tensor(labels))
+    return (i, torch.tensor(input_ids, dtype=torch.long), torch.tensor(attention_masks), torch.tensor(labels))
+
+
+# learning rate decay scheduler (cosine with warmup)
+def get_lr(it, warmup_iters, lr_decay_iters, min_lr, learning_rate):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > lr_decay_iters:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
+    return min_lr + coeff * (learning_rate - min_lr)
+
+
+
+def get_num_lines(f_path:str):
+    with open(f_path, "r") as f:
+        num_lines = 1
+        for line in f:
+            if line.strip():
+                num_lines += 1
+    return num_lines
