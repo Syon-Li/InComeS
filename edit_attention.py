@@ -217,28 +217,29 @@ class Edit_LlamaAttention(LlamaAttention):
             eps = 0.1
             if self.training:
                 if p0_loss_w>0:
-                    p0_loss = gist_weights[...,0].sum(-1) + eps
-                    p0_loss = -p0_loss.log().mean()
-
+                    p0_loss = -(gist_weights[...,0] + eps).log()
+                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w).item())
 
                 if pS_loss_w>0:
-                    q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
-                    mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    # q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
+                    # mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
                     mask[...,0] = 1
+                    # print("mask", mask, mask.shape)
 
-                    pS_loss = (gist_weights * mask[:,None,:,:]).sum(-1) + eps
-                    pS_loss = -pS_loss.log().mean()
+                    pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
+                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
 
                     extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w).item())
 
                 if sparsity_loss_w>0:
                     #Entropy
-                    sparsity_loss = -((gist_weights+eps) * (gist_weights+eps).log())
-                    sparsity_loss = sparsity_loss.sum(dim=-1).mean()
+                    sparsity_loss = -(gist_weights+eps) * (gist_weights+eps).log()
+                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
             
-                # print(sparsity_loss, p0_loss, pS_loss)
+                # print(p0_loss, pS_loss, sparsity_loss)
 
 
             if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -352,38 +353,39 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             # gist_logits = gist_logits + gist_logits_mask[:,None,...]
             
             # Calculate gist token attention
-            gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype) # [bsz, num_heads, q_len, gist_num]
             gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
-            gist_weights = gist_weights * gist_weights_mask[:,None,...]         
-            gist_output = torch.matmul(gist_weights, gist_values)
+            # print("gist_weight", gist_weights.shape)
+            gist_weights = gist_weights * gist_weights_mask[:,None,...]    
+            gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
             # print("gist_output", gist_output, gist_output.shape)
 
-
+            
+            
             sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
             eps = 1e-5
             if self.training:
                 if p0_loss_w>0:
-                    p0_loss = (gist_weights[...,0] + eps).log()
-                    p0_loss = -p0_loss.log() * atten_mask[:,None,:] / atten_mask[:,None,:].sum(-1)
-
+                    p0_loss = -(gist_weights[...,0] + eps).log()
+                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w).item())
 
                 if pS_loss_w>0:
-                    q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
-                    mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    # q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
+                    # mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
                     mask[...,0] = 1
                     # print("mask", mask, mask.shape)
 
-                    pS_loss = (gist_weights * mask[:,None,:,:]).sum(-1) + eps
-                    pS_loss = -pS_loss.log() * atten_mask[:,None,:] / atten_mask[:,None,:].sum(-1)
-
+                    pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
+                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
 
                     extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w).item())
 
                 if sparsity_loss_w>0:
                     #Entropy
-                    sparsity_loss = -((gist_weights+eps) * (gist_weights+eps).log())
-                    sparsity_loss = sparsity_loss.sum(dim=-1).mean()
+                    sparsity_loss = -(gist_weights+eps) * (gist_weights+eps).log()
+                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
             
                 # print(p0_loss, pS_loss, sparsity_loss)
