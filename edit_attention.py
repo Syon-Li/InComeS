@@ -214,7 +214,7 @@ class Edit_LlamaAttention(LlamaAttention):
 
             
             sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
-            eps = 0.1
+            eps = 1e-5
             if self.training:
                 if p0_loss_w>0:
                     p0_loss = -(gist_weights[...,0] + eps).log()
@@ -235,7 +235,7 @@ class Edit_LlamaAttention(LlamaAttention):
 
                 if sparsity_loss_w>0:
                     #Entropy
-                    sparsity_loss = -(gist_weights+eps) * (gist_weights+eps).log()
+                    sparsity_loss = -gist_weights * (gist_weights+eps).log()
                     sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
             
@@ -384,7 +384,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
 
                 if sparsity_loss_w>0:
                     #Entropy
-                    sparsity_loss = -(gist_weights+eps) * (gist_weights+eps).log()
+                    sparsity_loss = -gist_weights * (gist_weights+eps).log()
                     sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
                     extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
             
