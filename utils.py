@@ -116,7 +116,7 @@ class FileIterD(torch.utils.data.IterableDataset):
                     f_idxs.remove(idx)
                     break
             cnts[idx] += cnt
-            if cnts[idx]+1 >= iter_end_set[idx]:
+            if cnts[idx] >= iter_end_set[idx] - 1:
                 f_idxs.remove(idx)
 
             yield batch,input_ids
