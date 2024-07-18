@@ -191,6 +191,7 @@ class Edit_LlamaAttention(LlamaAttention):
             gist_logits = torch.matmul(query_states, gist_keys.transpose(1, 2)) / math.sqrt(self.head_dim)
 
             causal_mask, atten_mask = attention_mask
+            atten_mask = atten_mask.to(key_states.dtype).clone()
             if causal_mask is not None:  # no matter the length, we just slice it
                 causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
                 attn_weights = attn_weights + causal_mask
@@ -338,6 +339,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
             causal_mask, atten_mask = attention_mask
+            atten_mask = atten_mask.to(key_states.dtype).clone()
             if causal_mask is not None:
                 causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
@@ -353,10 +355,13 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             # gist_logits = gist_logits + gist_logits_mask[:,None,...]
             
             # Calculate gist token attention
+            gist_logits = gist_logits.clone().to(torch.float32)
+            gist_logits[...,0] = gist_logits[...,0] + gist_logits.quantile(q=0.25, dim=-1)
             gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype) # [bsz, num_heads, q_len, gist_num]
             gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
-            # print("gist_weight", gist_weights.shape)
+            
             gist_weights = gist_weights * gist_weights_mask[:,None,...]    
+            # print("layer ; gist_weight", self.layer_idx, torch.std_mean(gist_weights[atten_mask[:,None,:].repeat_interleave(repeats=gist_weights.shape[1], dim=1).to(torch.bool)], dim=-1), gist_weights.shape)
             gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
             # print("gist_output", gist_output, gist_output.shape)
 
@@ -367,26 +372,32 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             if self.training:
                 if p0_loss_w>0:
                     p0_loss = -(gist_weights[...,0] + eps).log()
-                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
-                    extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w).item())
+                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+
+                    if torch.isnan(p0_loss).item():
+                        print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
+                        print("attention_mask", atten_mask, atten_mask.sum(-1))
+                    extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w))
+
 
                 if pS_loss_w>0:
                     # q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
                     # mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    gist_pool_idx[...,0] = 1
                     mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
-                    mask[...,0] = 1
+                    # mask[...,0] = 1
                     # print("mask", mask, mask.shape)
 
                     pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
-                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
+                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
 
-                    extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w).item())
+                    extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w))
 
                 if sparsity_loss_w>0:
                     #Entropy
                     sparsity_loss = -gist_weights * (gist_weights+eps).log()
-                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
-                    extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
+                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                    extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w))
             
                 # print(p0_loss, pS_loss, sparsity_loss)
 
@@ -403,6 +414,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
             is_causal = True if causal_mask is None and q_len > 1 else False
 
+            # print("causal_mask:", (causal_mask==0))
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -561,10 +573,10 @@ class Edit_LlamaModel(LlamaModel):
             pass
 
 
-        # dtype, device = input_tensor.dtype, input_tensor.device
-        device = input_tensor.device
+        dtype, device = input_tensor.dtype, input_tensor.device
         dtype = torch.float16
         min_dtype = torch.finfo(dtype).min
+        # min_dtype = 1
         sequence_length = input_tensor.shape[1]
         target_length = (
             attention_mask.shape[-1]
@@ -588,7 +600,16 @@ class Edit_LlamaModel(LlamaModel):
             if attention_mask is not None:
                 causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                # if attention_mask.dim() == 1:
+                #     print("Attention mask of dimension 1:", attention_mask, attention_mask.shape)
+                # if causal_mask.dim() == 1:
+                #     print("causal mask of dimension 1:", causal_mask, causal_mask.shape)
+                try:
+                    padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                except:
+                    print("Attention mask of dimension 1:", attention_mask, attention_mask.shape)
+                    print("causal mask of dimension 1:", causal_mask, causal_mask.shape)
+
                 padding_mask = padding_mask == 0
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
@@ -676,13 +697,14 @@ class Edit_LlamaModel(LlamaModel):
         # print("causal_mask:", causal_mask)
 
 
-        col_segment = (reverse_cumsum(gist_idx_vector) > 0).to(torch.float)
-        row_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
+        col_segment = (reverse_cumsum(gist_idx_vector) > 0).to(inputs_embeds.dtype)
+        row_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(inputs_embeds.dtype)
         mask1 = row_segment[...,None].matmul(col_segment[:,None,:])
         # print("mask1", mask1, mask1.shape)
         causal_mask[mask1[:,None,...].to(torch.bool)] = torch.finfo(torch.float16).min
-        # print(inputs_embeds.dtype)
+        # causal_mask[mask1[:,None,...].to(torch.bool)] = 1
         # print("modified casual_mask", causal_mask, causal_mask.shape)
+
     
 
         # embed positions
@@ -714,7 +736,6 @@ class Edit_LlamaModel(LlamaModel):
                     cache_position=cache_position,
                 )
             else:
-                # print(hidden_states, hidden_states.shape)
                 layer_outputs, gist_pool, extra_loss = decoder_layer(
                     hidden_states,
                     attention_mask=(causal_mask, attention_mask),
@@ -859,9 +880,15 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            # print("loss", loss)
             loss_set.update({"CrossEntropy_loss": loss.item()})
             for k,v in extra_loss.items():
-                loss_k = torch.tensor(v).to(loss.device).mean()
+                # loss_k = torch.tensor(v).to(loss.device).mean()
+                if len(v)>0:
+                    loss_k = torch.stack(v).mean()
+                else:
+                    loss_k = torch.tensor(0)
+                # print("loss_k", loss_k)
                 loss_set.update({k:loss_k.item()})
                 loss = loss + loss_k
 
