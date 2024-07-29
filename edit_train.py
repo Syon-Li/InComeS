@@ -1,43 +1,64 @@
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaModel
 from edit_attention import Edit_LlamaModel, Edit_LlamaForCausalLM
-from utils import FileIterD, collate_fn_fileD, get_lr, get_num_lines
+from utils import FileIterD, collate_fn_fileD, get_lr, get_num_lines, wrap_collate_fn, HFIterD, collate_fn_hf
 from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate.utils import GradientAccumulationPlugin
 import argparse
 import torch
 import pickle
 import json
 import os
+import datetime
+from datasets import load_dataset
 
 os.environ["NCCL_DEBUG"] = "INFO"
+
+now = datetime.datetime.now()
 
 
 def main():
 
     parser = argparse.ArgumentParser(description='Pretraining.')
-    parser.add_argument('--gradaccu', type=int, default=1, help='number of gradient steps to use')
-    parser.add_argument('--batch_size', type=int, nargs="+", default=[8,8,8,8], help='the batch size for each dataloader')
-    parser.add_argument("--gist_num", type=int, default=10, help="number of gist token activations to keep")
+    parser.add_argument('--gradaccu', type=int, default=8, help='number of gradient steps to accumulate')
+    parser.add_argument('--batch_size', type=int, nargs="+", default=[16,8,4,4], help='the batch size for each dataloader')
+    parser.add_argument("--gist_num", type=int, default=100, help="number of gist token activations to keep")
     args = parser.parse_args()
 
-    end_point = 1e8
+    start_point = 0
+    end_point = 2
 
-    lr = 4e-5
-    min_lr = 4e-6
+    lr = 2e-5
+    min_lr = 2e-6
 
-    warmup_updates = 2000
+    warmup_updates = 1000
     max_updates = 20000
-    save_updates = 2000
+    save_updates = 20
 
-    warmup_iters = int(warmup_updates * args.gradaccu)
-    max_iters = int(max_updates * args.gradaccu)
-    save_iters = int(save_updates * args.gradaccu)
+    # warmup_updates = 50
+    # max_updates = 500
+    # save_updates = 100
 
-    loss_f_name = "training_loss_TinyLlama_Chat"
-    if os.path.exists("{}.json".format(loss_f_name)):
-        loss_f_name = loss_f_name + "_new"
+    accu_num = args.gradaccu
+
+    warmup_iters = warmup_updates * accu_num
+    max_iters = max_updates * accu_num
+    save_iters = save_updates * accu_num
     
-    checkpoint_dir = "./checkpoints/slimpajama_10B"
     model_name = "TinyLlama-1.1B-Chat"
+
+    loss_f_name = "train_loss_{}_{}".format(model_name, now.strftime('%Y-%m-%d_%H-%M'))
+
+    
+    batch_size = args.batch_size
+    # batch_size = 8
+
+    gist_num = args.gist_num
+
+    ds_name = "slimpajama_10B"
+    # ds_name = "openai_gsm8k"
+    extra_info = "no bias; trained without extra loss"
+
+    checkpoint_dir = "./checkpoints/{}/checkpoints_{}".format(ds_name, now.strftime('%Y-%m-%d_%H-%M'))
 
     
 
@@ -64,10 +85,7 @@ def main():
 
     gist_pool = {}
     for i in range(model.config.num_hidden_layers):
-        gist_pool.update({i: 
-                        {"keys": torch.zeros((1, model.config.num_key_value_heads, model.config.hidden_size // model.config.num_attention_heads)), 
-                        "values": torch.randn((1, model.config.num_key_value_heads, model.config.hidden_size // model.config.num_attention_heads))}
-                        })
+        gist_pool.update({i:{"keys":torch.tensor([]), "values":torch.tensor([])}})
         
 
     
@@ -81,34 +99,61 @@ def main():
         # num_lines = get_num_lines(f_path)
         # print("num_lines", num_lines)
         f_path_set.append(f_path)
-        start_set.append(0)
+        start_set.append(start_point)
         end_set.append(int(end_point))
 
-    ds = FileIterD(f_path_set=f_path_set, start_set=start_set, end_set=end_set, batch_size=args.batch_size)
+    ds = FileIterD(f_path_set=f_path_set, start_set=start_set, end_set=end_set, batch_size=batch_size)
     train_dataloader = torch.utils.data.DataLoader(ds, collate_fn=collate_fn_fileD)
     # print(list(train_dataloader)[:3])
 
 
+    # ds = HFIterD(f_path="openai/gsm8k", batch_size=batch_size, subset="main", split="train", cache_dir="transformers_cache", tokenizer=tokenizer)
+    # ds = load_dataset("openai/gsm8k", "main", split="train", cache_dir="transformers_cache", streaming=True)
+    # train_dataloader = torch.utils.data.DataLoader(ds, collate_fn=collate_fn_hf)
+    # for i, (input_ids, attention_mask, labels) in enumerate(train_dataloader):
+    #     print(input_ids, input_ids.shape)
+    #     print(attention_mask, attention_mask.shape)
+    #     print(labels, labels.shape)
+    #     if i==5:
+    #         break
+
+
+
     accelerator = Accelerator(
-                            gradient_accumulation_steps=args.gradaccu, 
                             dataloader_config=DataLoaderConfiguration(dispatch_batches=False), 
+                            gradient_accumulation_plugin=GradientAccumulationPlugin(num_steps=accu_num, 
+                                                                                    #   sync_each_batch=True,
+                                                                                    ),
                             log_with="wandb",
                             )
     print(accelerator.device, accelerator.process_index, accelerator.distributed_type,)
     # model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
-    loss_weights = {"sparsity_loss_w":1,"p0_loss_w":1,"pS_loss_w":1}
+    # print("warmup_iters: ", warmup_iters)
+    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_updates, total_iters=warmup_iters)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(max_iters - warmup_iters), eta_min=min_lr)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_iters])
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
+    loss_weights = {"sparsity_loss_w":1e-2, "p0_loss_w":1e-2, "pS_loss_w":1e-2}
     
 
 
-    # accelerator.load_state(input_dir="/apdcephfs_qy3/share_733425/zhisonzhang/users/shuaiyili/Gist_slimpajama_checkpoint")
-    # print(accelerator.state)
+    # accelerator.load_state(input_dir="/apdcephfs_qy3/share_733425/zhisonzhang/users/shuaiyili/checkpoints/slimpajama_10B/checkpoints_2024-07-12_23-00/checkpoint_32000")
+    # with open("/apdcephfs_qy3/share_733425/zhisonzhang/users/shuaiyili/checkpoints/slimpajama_10B/checkpoints_2024-07-12_23-00/checkpoint_48000/checkpoint_config.pickle", 'rb') as f:
+    #     obj = pickle.load(f)
+    # gist_pool = obj["gist_pool"] 
+    # print("gist_values", gist_pool[2]["values"], gist_pool[2]["values"].shape)
+
     config = {"model": model_name,
-              "dataset": "slimpajama_10B",}
-    accelerator.init_trackers("gist-model-editing", config=config)
+              "batch_size": batch_size,
+              "accu_num": accu_num,
+              "gist_num": gist_num,
+              "loss_weights": loss_weights,
+              "extra_info": extra_info,
+              "dataset": ds_name,}
+    # accelerator.init_trackers("gist-model-editing", config=config)
     model.train()
-    for local_step, (global_step, input_ids, attention_mask, labels) in enumerate(train_dataloader):
+    for local_step, (input_ids, attention_mask, labels) in enumerate(train_dataloader):
         with accelerator.accumulate(model):
             bsz = input_ids.shape[0]
             gist_pool_idx = torch.zeros(bsz, len(gist_pool[0]["keys"])+1) #plus one to consider the zero gist key and value
@@ -119,9 +164,7 @@ def main():
                 if gist_token_ids in input_ids[i]:
                     gist_pool_idx[i,col] = 1
                     col += 1
-            
-            # input_ids = input_ids.to(device)
-            # attention_mask = attention_mask.to(device)
+            # print("gist_pool_idx ", gist_pool_idx, gist_pool_idx.shape)
             outputs, gist_pool, loss_set = model(input_ids=input_ids, 
                                                 attention_mask=attention_mask, 
                                                 labels=labels,
@@ -131,44 +174,44 @@ def main():
                                                 loss_weights=loss_weights,
                                                 use_cache=False,
                                                 )
-            loss = outputs.loss
-            # print(loss_set)
-            accelerator.backward(loss)
-            optimizer.step()
-            lr_updated = get_lr(local_step+1, warmup_iters=warmup_iters, lr_decay_iters=max_iters, min_lr=min_lr, learning_rate=lr)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr_updated
-                # print("it;lr",it, param_group["lr"])
-            optimizer.zero_grad()
+            # loss = outputs.loss
+            # accelerator.backward(loss)
+            # optimizer.step()
+            # scheduler.step()
+            # optimizer.zero_grad()
+            # print('{}, local_step:{}, lr:{}, updates:{}'.format(input_ids.shape, local_step+1, optimizer.param_groups[0]['lr'], (local_step+1) // accu_num)) 
 
-            loss_set.update({"lr":lr_updated})
-            accelerator.log(loss_set, step=global_step+1)
-            # print('{}, local_step:{}, global_step:{}, lr:{}'.format(input_ids.shape, local_step+1, global_step+1, lr_updated))
+        # if (local_step+1) % accu_num == 0:
+        #     updates = (local_step+1) // accu_num
+        #     loss_set.update({"lr":optimizer.param_groups[0]['lr']})
+        #     accelerator.log(loss_set, step=updates)
+        #     # print(loss_set, updates)
+        #     if updates % save_updates==0:
+        #         accelerator.wait_for_everyone()
+        #         accelerator.save_state(output_dir="{}/checkpoint_{}".format(checkpoint_dir, local_step+1))
+        #         if accelerator.is_main_process:
+        #             checkpoint_config = {"gist_pool":gist_pool, "local_step": local_step+1}
+        #             with open('{}/checkpoint_{}/checkpoint_config.pickle'.format(checkpoint_dir, local_step+1), 'wb') as f:
+        #                 pickle.dump(checkpoint_config, f)                    
 
-        loss_set.update({"input_ids_shape":input_ids.shape, "lr":lr_updated, "global_step":global_step+1, "local_step":local_step+1})
-        with open("{}.json".format(loss_f_name), "a") as file:
-            json.dump(loss_set, file)
-            file.write("\n")
+        #     loss_set.update({"input_ids_shape":input_ids.shape, "local_step": local_step+1, "lr":optimizer.param_groups[0]['lr'], "updates": updates})
+        #     with open("loss_record/{}.json".format(loss_f_name), "a") as file:
+        #         json.dump(loss_set, file)
+        #         file.write("\n")
 
         for key,value in gist_pool.items():
             value["keys"] = value["keys"].detach()
             value["values"] = value["values"].detach()
-            if len(value["keys"]) > args.gist_num:
-                value["keys"] = value["keys"][-args.gist_num:]
-                value["values"] = value["values"][-args.gist_num:]
+            if len(value["keys"]) > gist_num:
+                value["keys"] = value["keys"][-gist_num:]
+                value["values"] = value["values"][-gist_num:]
             # print("value[keys].shape[0]", value["keys"].shape[0])
-        
-        if (local_step+1) % save_iters == 0:
-            accelerator.wait_for_everyone()
-            accelerator.save_state(output_dir="{}/checkpoint_{}".format(checkpoint_dir, local_step+1))
-            if accelerator.is_main_process:
-                checkpoint_config = {"gist_pool":gist_pool, "global_step":global_step+1, "local_step":local_step+1}
-                with open('{}/checkpoint_{}/checkpoint_config.pickle'.format(checkpoint_dir, local_step+1), 'wb') as f:
-                    pickle.dump(checkpoint_config, f)
+
+
+    # accelerator.wait_for_everyone()
+    # accelerator.save_model(model, "{}/model".format(checkpoint_dir))  
+    # accelerator.end_training() 
     
-    accelerator.wait_for_everyone()
-    accelerator.save_model(model, "{}/model".format(checkpoint_dir))
-    accelerator.end_training()
             
 
 
