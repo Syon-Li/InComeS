@@ -174,30 +174,30 @@ def main():
                                                 loss_weights=loss_weights,
                                                 use_cache=False,
                                                 )
-            # loss = outputs.loss
-            # accelerator.backward(loss)
-            # optimizer.step()
-            # scheduler.step()
-            # optimizer.zero_grad()
-            # print('{}, local_step:{}, lr:{}, updates:{}'.format(input_ids.shape, local_step+1, optimizer.param_groups[0]['lr'], (local_step+1) // accu_num)) 
+            loss = outputs.loss
+            accelerator.backward(loss)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            print('{}, local_step:{}, lr:{}, updates:{}'.format(input_ids.shape, local_step+1, optimizer.param_groups[0]['lr'], (local_step+1) // accu_num)) 
 
-        # if (local_step+1) % accu_num == 0:
-        #     updates = (local_step+1) // accu_num
-        #     loss_set.update({"lr":optimizer.param_groups[0]['lr']})
-        #     accelerator.log(loss_set, step=updates)
-        #     # print(loss_set, updates)
-        #     if updates % save_updates==0:
-        #         accelerator.wait_for_everyone()
-        #         accelerator.save_state(output_dir="{}/checkpoint_{}".format(checkpoint_dir, local_step+1))
-        #         if accelerator.is_main_process:
-        #             checkpoint_config = {"gist_pool":gist_pool, "local_step": local_step+1}
-        #             with open('{}/checkpoint_{}/checkpoint_config.pickle'.format(checkpoint_dir, local_step+1), 'wb') as f:
-        #                 pickle.dump(checkpoint_config, f)                    
+        if (local_step+1) % accu_num == 0:
+            updates = (local_step+1) // accu_num
+            loss_set.update({"lr":optimizer.param_groups[0]['lr']})
+            accelerator.log(loss_set, step=updates)
+            # print(loss_set, updates)
+            if updates % save_updates==0:
+                accelerator.wait_for_everyone()
+                accelerator.save_state(output_dir="{}/checkpoint_{}".format(checkpoint_dir, local_step+1))
+                if accelerator.is_main_process:
+                    checkpoint_config = {"gist_pool":gist_pool, "local_step": local_step+1}
+                    with open('{}/checkpoint_{}/checkpoint_config.pickle'.format(checkpoint_dir, local_step+1), 'wb') as f:
+                        pickle.dump(checkpoint_config, f)                    
 
-        #     loss_set.update({"input_ids_shape":input_ids.shape, "local_step": local_step+1, "lr":optimizer.param_groups[0]['lr'], "updates": updates})
-        #     with open("loss_record/{}.json".format(loss_f_name), "a") as file:
-        #         json.dump(loss_set, file)
-        #         file.write("\n")
+            loss_set.update({"input_ids_shape":input_ids.shape, "local_step": local_step+1, "lr":optimizer.param_groups[0]['lr'], "updates": updates})
+            with open("loss_record/{}.json".format(loss_f_name), "a") as file:
+                json.dump(loss_set, file)
+                file.write("\n")
 
         for key,value in gist_pool.items():
             value["keys"] = value["keys"].detach()
@@ -208,9 +208,9 @@ def main():
             # print("value[keys].shape[0]", value["keys"].shape[0])
 
 
-    # accelerator.wait_for_everyone()
-    # accelerator.save_model(model, "{}/model".format(checkpoint_dir))  
-    # accelerator.end_training() 
+    accelerator.wait_for_everyone()
+    accelerator.save_model(model, "{}/model".format(checkpoint_dir))  
+    accelerator.end_training() 
     
             
 
