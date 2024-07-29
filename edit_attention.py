@@ -92,14 +92,20 @@ def make_gist_mask(inputs: torch.Tensor, gist_token: int, pad_token: int, dtype=
 
 
 
-def alter_position_ids(gist_token_ids: int, input_ids: torch.Tensor):
-    conditions = ((input_ids == gist_token_ids).cumsum(-1) >= 1)
-    ones = torch.ones(input_ids.shape).to(input_ids.device)
-    zeros = torch.zeros(input_ids.shape).to(input_ids.device)
-    position_ids_right = torch.where(conditions, ones, zeros).cumsum(-1) - 2
-    position_ids_left = reverse_cumsum(torch.where(conditions.eq(False), -ones, zeros)) - 1
-    position_ids = torch.where(conditions, position_ids_right, position_ids_left)
-    return position_ids
+def alter_position_ids(gist_token_ids: int, input_ids: torch.Tensor, origin_pos_ids: torch.tensor):
+    gist_loc = torch.nonzero(input_ids == gist_token_ids)
+    if len(gist_loc)>0:
+        pos_ids = origin_pos_ids.repeat_interleave(input_ids.shape[0], dim=0) - (gist_loc[...,-1] + 1).reshape(input_ids.shape[0], -1)
+    else:
+        pos_ids = origin_pos_ids
+
+    # conditions = ((input_ids == gist_token_ids).cumsum(-1) >= 1)
+    # ones = torch.ones(input_ids.shape).to(input_ids.device)
+    # zeros = torch.zeros(input_ids.shape).to(input_ids.device)
+    # position_ids_right = torch.where(conditions, ones, zeros).cumsum(-1) - 2
+    # position_ids_left = reverse_cumsum(torch.where(conditions.eq(False), -ones, zeros)) - 1
+    # position_ids = torch.where(conditions, position_ids_right, position_ids_left)
+    return pos_ids
 
 
 
@@ -108,8 +114,8 @@ def alter_position_ids(gist_token_ids: int, input_ids: torch.Tensor):
 class Edit_LlamaAttention(LlamaAttention):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        self.zero_gist_key = nn.parameter.Parameter(data=torch.randn((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)))
-        self.zero_gist_value = nn.parameter.Parameter(data=torch.zeros((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)), requires_grad=False)
+        self.zero_gist_key = nn.parameter.Parameter(data=torch.randn((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)) * 2.5)
+        # self.zero_gist_value = nn.parameter.Parameter(data=torch.zeros((1, config.num_key_value_heads, config.hidden_size // config.num_attention_heads)), requires_grad=False)
 
 
     def forward(
@@ -164,14 +170,16 @@ class Edit_LlamaAttention(LlamaAttention):
 
 
             #updating new gist
-            new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
-            new_gist_values = value_states.transpose(1,2)[gist_idx_vector]
-            gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys])
-            gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values])
+            if gist_idx_vector.sum().item()>0:
+                new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
+                new_gist_values = value_states.transpose(1,2)[gist_idx_vector]
+                gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys])
+                gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values])        
 
             #Add zero gist key and value
+            zero_values = torch.zeros((1, self.num_key_value_heads, self.hidden_size // self.num_heads)).to(query_states.device)
             gist_keys = torch.concat([self.zero_gist_key, gist_pool[self.layer_idx]["keys"]]) # [num_gist+1,key_value_head,head_dim]
-            gist_values = torch.concat([self.zero_gist_value, gist_pool[self.layer_idx]["values"]])
+            gist_values = torch.concat([zero_values, gist_pool[self.layer_idx]["values"]])
             # print('gist key and value size', gist_keys.shape, gist_values.shape)
 
 
@@ -214,31 +222,35 @@ class Edit_LlamaAttention(LlamaAttention):
             # print(attn_output.shape, gist_output.shape)
 
             
-            sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
-            eps = 1e-5
+
             if self.training:
+                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
+                eps = 1e-5
+
                 if p0_loss_w>0:
                     p0_loss = -(gist_weights[...,0] + eps).log()
-                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
-                    extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w).item())
+                    p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+
+                    extra_loss["p0_loss"].append(p0_loss)
 
                 if pS_loss_w>0:
                     # q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
                     # mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
+                    gist_pool_idx[...,0] = 0
                     mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
-                    mask[...,0] = 1
+                    # mask[...,0] = 1
                     # print("mask", mask, mask.shape)
 
                     pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
-                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
+                    pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
 
-                    extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w).item())
+                    extra_loss["pS_loss"].append(pS_loss)
 
                 if sparsity_loss_w>0:
                     #Entropy
                     sparsity_loss = -gist_weights * (gist_weights+eps).log()
-                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / atten_mask[:,None,:].sum(-1)).mean()
-                    extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w).item())
+                    sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                    extra_loss["sparsity_loss"].append(sparsity_loss)
             
                 # print(p0_loss, pS_loss, sparsity_loss)
 
@@ -315,19 +327,24 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+            # print("key_states mean std", key_states.mean(), key_states.std(dim=-1).mean())
+            # print("value_states std", value_states.std(dim=-1).mean())
+
             cos, sin = self.rotary_emb(value_states, position_ids)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
             
             #updating new gist
-            new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
-            new_gist_values = value_states.transpose(1,2)[gist_idx_vector]
-            gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys])
-            gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values])
+            if gist_idx_vector.sum().item()>0:
+                new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
+                new_gist_values = value_states.transpose(1,2)[gist_idx_vector]
+                gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys])
+                gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values])        
 
             #Add zero gist key and value
+            zero_values = torch.zeros((1, self.num_key_value_heads, self.hidden_size // self.num_heads)).to(query_states.device)
             gist_keys = torch.concat([self.zero_gist_key, gist_pool[self.layer_idx]["keys"]]) # [num_gist+1,key_value_head,head_dim]
-            gist_values = torch.concat([self.zero_gist_value, gist_pool[self.layer_idx]["values"]])
+            gist_values = torch.concat([zero_values, gist_pool[self.layer_idx]["values"]])
 
 
             if past_key_value is not None:
@@ -348,28 +365,32 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
 
             gist_logits = torch.matmul(query_states, gist_keys.transpose(1, 2)) / math.sqrt(self.head_dim)
             atten_mask[reverse_cumsum(gist_idx_vector)>0] = 0
-            # gist_logits_mask = atten_mask[...,None].matmul(torch.ones(bsz, 1, gist_logits.shape[-1]).to(hidden_states.device)) * torch.finfo(hidden_states.dtype).min
             gist_weights_mask = atten_mask[...,None].matmul(torch.ones(bsz, 1, gist_logits.shape[-1]).to(hidden_states.device))
 
-            #Mask padding tokens and all tokens preceding gist tokens (including itself)
-            # gist_logits = gist_logits + gist_logits_mask[:,None,...]
-            
+
             # Calculate gist token attention
-            gist_logits = gist_logits.clone().to(torch.float32)
-            gist_logits[...,0] = gist_logits[...,0] + gist_logits.quantile(q=0.25, dim=-1)
+            # gist_logits = gist_logits.clone()
+            # gist_logits[...,0] = gist_logits[...,0] + 12
+            # gist_logits[...,0] = gist_logits[...,0] + gist_logits.quantile(q=0.25, dim=-1)
+
+
             gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype) # [bsz, num_heads, q_len, gist_num]
+            # print("gist_weights[...,0]", gist_weights[...,0].mean(), (0.95 - gist_weights[...,0]).mean(), gist_logits.exp().sum(dim=-1).mean())
             gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
             
-            gist_weights = gist_weights * gist_weights_mask[:,None,...]    
-            # print("layer ; gist_weight", self.layer_idx, torch.std_mean(gist_weights[atten_mask[:,None,:].repeat_interleave(repeats=gist_weights.shape[1], dim=1).to(torch.bool)], dim=-1), gist_weights.shape)
+            gist_weights = gist_weights * gist_weights_mask[:,None,...]
+            # torch.std_mean(gist_weights[atten_mask[:,None,:].repeat_interleave(repeats=gist_weights.shape[1], dim=1).to(torch.bool)], dim=-1)
+            print("layer ; gist_weight", self.layer_idx, gist_weights, gist_weights.shape)
             gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
-            # print("gist_output", gist_output, gist_output.shape)
+            # print("gist_values", gist_values, gist_values.shape, self.layer_idx)
+            # print("gist_output", gist_output, gist_output.shape, self.layer_idx)
 
-            
-            
-            sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
-            eps = 1e-5
+        
+
             if self.training:
+                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
+                eps = 1e-5
+
                 if p0_loss_w>0:
                     p0_loss = -(gist_weights[...,0] + eps).log()
                     p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
@@ -377,13 +398,10 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
                     if torch.isnan(p0_loss).item():
                         print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
                         print("attention_mask", atten_mask, atten_mask.sum(-1))
-                    extra_loss["p0_loss"].append(p0_loss.mul(p0_loss_w))
-
+                    extra_loss["p0_loss"].append(p0_loss)
 
                 if pS_loss_w>0:
-                    # q_len_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(torch.float)
-                    # mask = q_len_segment[...,None].matmul(gist_pool_idx[:,None,:])
-                    gist_pool_idx[...,0] = 1
+                    gist_pool_idx[...,0] = 0
                     mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
                     # mask[...,0] = 1
                     # print("mask", mask, mask.shape)
@@ -391,13 +409,13 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
                     pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
                     pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
 
-                    extra_loss["pS_loss"].append(pS_loss.mul(pS_loss_w))
+                    extra_loss["pS_loss"].append(pS_loss)
 
                 if sparsity_loss_w>0:
                     #Entropy
                     sparsity_loss = -gist_weights * (gist_weights+eps).log()
                     sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-                    extra_loss["sparsity_loss"].append(sparsity_loss.mul(sparsity_loss_w))
+                    extra_loss["sparsity_loss"].append(sparsity_loss)
             
                 # print(p0_loss, pS_loss, sparsity_loss)
 
@@ -414,12 +432,11 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
             is_causal = True if causal_mask is None and q_len > 1 else False
 
-            # print("causal_mask:", (causal_mask==0))
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
-                attn_mask=causal_mask,
+                attn_mask=causal_mask.to(hidden_states.dtype),
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
             )
@@ -576,7 +593,6 @@ class Edit_LlamaModel(LlamaModel):
         dtype, device = input_tensor.dtype, input_tensor.device
         dtype = torch.float16
         min_dtype = torch.finfo(dtype).min
-        # min_dtype = 1
         sequence_length = input_tensor.shape[1]
         target_length = (
             attention_mask.shape[-1]
@@ -689,12 +705,12 @@ class Edit_LlamaModel(LlamaModel):
 
 
         # print(position_ids)
-        position_ids = alter_position_ids(gist_token_ids=gist_token_ids, input_ids=input_ids)
+        position_ids = alter_position_ids(gist_token_ids=gist_token_ids, input_ids=input_ids, origin_pos_ids=position_ids)
         # print(position_ids)
 
         # print("self.config._attn_implementation", self.config._attn_implementation)
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
-        # print("causal_mask:", causal_mask)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens) # [bsz, 1, q_len, q_len]
+        # print("causal_mask:", causal_mask, causal_mask.shape)
 
 
         col_segment = (reverse_cumsum(gist_idx_vector) > 0).to(inputs_embeds.dtype)
@@ -702,7 +718,6 @@ class Edit_LlamaModel(LlamaModel):
         mask1 = row_segment[...,None].matmul(col_segment[:,None,:])
         # print("mask1", mask1, mask1.shape)
         causal_mask[mask1[:,None,...].to(torch.bool)] = torch.finfo(torch.float16).min
-        # causal_mask[mask1[:,None,...].to(torch.bool)] = 1
         # print("modified casual_mask", causal_mask, causal_mask.shape)
 
     
@@ -890,7 +905,7 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
                     loss_k = torch.tensor(0)
                 # print("loss_k", loss_k)
                 loss_set.update({k:loss_k.item()})
-                loss = loss + loss_k
+                # loss = loss + loss_k.mul(loss_weights[k])
 
         if not return_dict:
             output = (logits,) + outputs[1:]
