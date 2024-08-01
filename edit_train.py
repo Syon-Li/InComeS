@@ -25,14 +25,14 @@ def main():
     args = parser.parse_args()
 
     start_point = 0
-    end_point = 2
+    end_point = 1e8
 
     lr = 2e-5
     min_lr = 2e-6
 
-    warmup_updates = 1000
+    warmup_updates = 2000
     max_updates = 20000
-    save_updates = 20
+    save_updates = 2000
 
     # warmup_updates = 50
     # max_updates = 500
@@ -56,7 +56,7 @@ def main():
 
     ds_name = "slimpajama_10B"
     # ds_name = "openai_gsm8k"
-    extra_info = "no bias; trained without extra loss"
+    extra_info = "add bias 12; trained with extra loss"
 
     checkpoint_dir = "./checkpoints/{}/checkpoints_{}".format(ds_name, now.strftime('%Y-%m-%d_%H-%M'))
 
@@ -130,11 +130,11 @@ def main():
     # model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # print("warmup_iters: ", warmup_iters)
-    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_updates, total_iters=warmup_iters)
-    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(max_iters - warmup_iters), eta_min=min_lr)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_iters])
+    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_updates, total_iters=warmup_iters/2)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(max_iters - warmup_iters)/2, eta_min=min_lr, last_epoch=max_iters)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_iters/2])
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
-    loss_weights = {"sparsity_loss_w":1e-2, "p0_loss_w":1e-2, "pS_loss_w":1e-2}
+    loss_weights = {"sparsity_loss":1e-2, "p0_loss":1e-2, "pS_loss":1e-2}
     
 
 
@@ -145,13 +145,15 @@ def main():
     # print("gist_values", gist_pool[2]["values"], gist_pool[2]["values"].shape)
 
     config = {"model": model_name,
+              "save_updates": save_updates,
+              "warmup_updates": warmup_updates,
               "batch_size": batch_size,
               "accu_num": accu_num,
               "gist_num": gist_num,
               "loss_weights": loss_weights,
               "extra_info": extra_info,
               "dataset": ds_name,}
-    # accelerator.init_trackers("gist-model-editing", config=config)
+    accelerator.init_trackers("gist-model-editing", config=config)
     model.train()
     for local_step, (input_ids, attention_mask, labels) in enumerate(train_dataloader):
         with accelerator.accumulate(model):
@@ -179,7 +181,7 @@ def main():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            print('{}, local_step:{}, lr:{}, updates:{}'.format(input_ids.shape, local_step+1, optimizer.param_groups[0]['lr'], (local_step+1) // accu_num)) 
+            # print('{}, local_step:{}, lr:{}, updates:{}'.format(input_ids.shape, local_step+1, optimizer.param_groups[0]['lr'], (local_step+1) // accu_num)) 
 
         if (local_step+1) % accu_num == 0:
             updates = (local_step+1) // accu_num
