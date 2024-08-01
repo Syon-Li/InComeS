@@ -224,7 +224,7 @@ class Edit_LlamaAttention(LlamaAttention):
             
 
             if self.training:
-                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
+                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss"], loss_weights["p0_loss"], loss_weights["pS_loss"]
                 eps = 1e-5
 
                 if p0_loss_w>0:
@@ -369,8 +369,8 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
 
 
             # Calculate gist token attention
-            # gist_logits = gist_logits.clone()
-            # gist_logits[...,0] = gist_logits[...,0] + 12
+            gist_logits = gist_logits.clone()
+            gist_logits[...,0] = gist_logits[...,0] + 12
             # gist_logits[...,0] = gist_logits[...,0] + gist_logits.quantile(q=0.25, dim=-1)
 
 
@@ -380,7 +380,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
             
             gist_weights = gist_weights * gist_weights_mask[:,None,...]
             # torch.std_mean(gist_weights[atten_mask[:,None,:].repeat_interleave(repeats=gist_weights.shape[1], dim=1).to(torch.bool)], dim=-1)
-            print("layer ; gist_weight", self.layer_idx, gist_weights, gist_weights.shape)
+            # print("layer ; gist_weight", self.layer_idx, gist_weights, gist_weights.shape)
             gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
             # print("gist_values", gist_values, gist_values.shape, self.layer_idx)
             # print("gist_output", gist_output, gist_output.shape, self.layer_idx)
@@ -388,7 +388,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
         
 
             if self.training:
-                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss_w"], loss_weights["p0_loss_w"], loss_weights["pS_loss_w"]
+                sparsity_loss_w, p0_loss_w, pS_loss_w = loss_weights["sparsity_loss"], loss_weights["p0_loss"], loss_weights["pS_loss"]
                 eps = 1e-5
 
                 if p0_loss_w>0:
@@ -401,7 +401,7 @@ class Edit_LlamaSdpaAttention(Edit_LlamaAttention):
                     extra_loss["p0_loss"].append(p0_loss)
 
                 if pS_loss_w>0:
-                    gist_pool_idx[...,0] = 0
+                    gist_pool_idx[...,0] = 1
                     mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:])
                     # mask[...,0] = 1
                     # print("mask", mask, mask.shape)
@@ -905,7 +905,7 @@ class Edit_LlamaForCausalLM(LlamaForCausalLM):
                     loss_k = torch.tensor(0)
                 # print("loss_k", loss_k)
                 loss_set.update({k:loss_k.item()})
-                # loss = loss + loss_k.mul(loss_weights[k])
+                loss = loss + loss_k.mul(loss_weights[k])
 
         if not return_dict:
             output = (logits,) + outputs[1:]
