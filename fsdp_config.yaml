@@ -8,14 +8,14 @@ fsdp_config:
   fsdp_forward_prefetch: false
   fsdp_cpu_ram_efficient_loading: true
   fsdp_offload_params: false
-  fsdp_sharding_strategy: SHARD_GRAD_OP
+  fsdp_sharding_strategy: FULL_SHARD
   fsdp_state_dict_type: SHARDED_STATE_DICT
   fsdp_sync_module_states: true
-  fsdp_min_num_params: 10000
+  fsdp_min_num_params: 1000
   fsdp_use_orig_params: true
 machine_rank: 0
 main_training_function: main
-mixed_precision: fp16
+mixed_precision: bf16
 num_machines: 1
 num_processes: 8
 use_cpu: false
