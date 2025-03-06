@@ -106,7 +106,7 @@ def main():
         model = Edit_GPTJForCausalLM.from_pretrained(model_path, local_files_only=True)
         # model.gradient_checkpointing_enable()
     elif "qwen" in model_path.lower():
-        # apply_liger_kernel_to_qwen2()
+        apply_liger_kernel_to_qwen2()
         model = Edit_Qwen2ForCausalLM.from_pretrained(model_path, local_files_only=True, attn_implementation="sdpa")
     origin_model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True, attn_implementation="sdpa")
  
