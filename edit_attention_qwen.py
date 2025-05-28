@@ -1,8 +1,7 @@
 #  transformer v4.45.2
 
 import torch
-import random
-import warnings
+import copy
 from torch import nn
 import torch.nn.functional as F
 import math
@@ -14,7 +13,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
     _flash_attention_forward,
     Qwen2DecoderLayer,
     Qwen2Config,
-    Qwen2RMSNorm,
     Qwen2Model,
     Qwen2ForCausalLM,
     GenerationMixin,
@@ -29,11 +27,10 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging, is_torchdynamo_compiling
-from liger_kernel.transformers import liger_rotary_pos_emb, LigerRMSNorm
-from utils import reverse_cumsum, alter_position_ids, sattolo_cycle
-import os
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss, LigerFusedLinearJSD
+from utils import reverse_cumsum, alter_position_ids
 
 
 logger = logging.get_logger(__name__)
@@ -51,6 +48,8 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
         self.n_layers = config.num_hidden_layers
         if layer_idx < self.n_layers//2:
             self.zero_gist_key.requires_grad = False
+        else:
+            self.zero_gist_key.requires_grad = True
 
 
     # Adapted from Qwen2Attention.forward
@@ -63,7 +62,6 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
         gist_pool: Optional[Dict[int, Dict]] = None, #[num_gist+1, num_key_value_head, head_dim]
         gist_idx_vector: Optional[torch.Tensor] = None, #[bsz, q_len]
         gist_pool_idx: Optional[torch.Tensor] = None, #[bsz, num_gist+1]
-        extra_loss: Optional[Dict[str, List]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -94,20 +92,20 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-
-        for _,v in gist_pool.items():
-            v['keys'] = v['keys'].to(query_states.device)
-            v["values"] = v["values"].to(query_states.device)
+        gist_pool = copy.copy(gist_pool) # in favor of the gradient checkpointing
+        gist_pool['keys'] = gist_pool['keys'].to(query_states.device)
+        gist_pool["values"] = gist_pool["values"].to(query_states.device)
 
         # updating new gist
         if self.layer_idx >= self.n_layers//2 and gist_idx_vector.any().item():
             new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
             new_gist_values = value_states.transpose(1,2)[gist_idx_vector]                               
-            gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys]).to(query_states.device)
-            gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values]).to(query_states.device)
+            gist_pool["keys"] = torch.concat([gist_pool["keys"], new_gist_keys]).to(query_states.device)
+            gist_pool["values"] = torch.concat([gist_pool["values"], new_gist_values]).to(query_states.device)
 
-        raw_gist_keys = gist_pool[self.layer_idx]["keys"]
-        raw_gist_values = gist_pool[self.layer_idx]["values"]   
+        raw_gist_keys = gist_pool["keys"]
+        raw_gist_values = gist_pool["values"]
+
     
         # Add zero gist key and value
         zero_values = torch.zeros(1, self.num_key_value_heads, self.head_dim, device=query_states.device)
@@ -127,7 +125,6 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
         else:
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        # query_states, key_states = liger_rotary_pos_emb(q=query_states, k=key_states, cos=cos, sin=sin)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
@@ -141,75 +138,51 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
 
-
-        # # gist_keys = gist_keys.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1)
-        # # gist_values = gist_values.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1) 
-        # # gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys.transpose(1, 2)) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
         num_gist = gist_keys.shape[0]
-        gist_keys = gist_keys[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1)
-        gist_values = gist_values[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1)
-        gist_keys = gist_keys.reshape(self.num_heads, self.head_dim, num_gist)
-        gist_values = gist_values.reshape(self.num_heads, num_gist, self.head_dim)
-        gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
-        
+        gist_keys = gist_keys[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1).reshape(num_gist, self.num_heads, self.head_dim)
+        gist_values = gist_values[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1).reshape(num_gist, self.num_heads, self.head_dim)
+        gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys.permute(1, 2, 0)) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
+
+        if not self.training and self.layer_idx >= self.n_layers//2 and gist_keys.shape[0]>10:
+            gist_logits = gist_logits / 0.45
         gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype) # [bsz, num_heads, q_len, gist_num]
         gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
         atten_mask = atten_mask.to(key_states.dtype).clone()
         atten_mask[reverse_cumsum(gist_idx_vector)>0] = 0
         gist_weights = gist_weights * atten_mask[:,None,:,None]
-        gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
+        gist_output = torch.matmul(gist_weights, gist_values.permute(1, 0, 2)) # [bsz, num_heads, q_len, head_dim]
 
 
 
-        if not self.training:
-            eps = 1e-5
-            # Entropy
-            sparsity_loss = -gist_weights * (gist_weights+eps).log()
-            sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-            # print("sparsity_loss", sparsity_loss)
-            if extra_loss is not None:
-                # extra_loss["Entropy"].append(sparsity_loss)        
-                extra_loss["Entropy"].append((self.layer_idx, sparsity_loss))   
-    
-
-    
-
+        extra_loss = {}
         if self.training and gist_pool_idx is not None and self.layer_idx >= self.n_layers//2:
-            eps = 1e-5
+            with torch.no_grad():
+                eps = 1e-5
 
-            p0_loss = -(gist_weights[...,0] + eps).log()
-            p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                p0_loss = -(gist_weights[...,0] + eps).log()
+                p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
 
-            if torch.isnan(p0_loss).item():
-                print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
-                print("attention_mask", atten_mask, atten_mask.sum(-1))
+                if torch.isnan(p0_loss).item():
+                    print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
+                    print("attention_mask", atten_mask, atten_mask.sum(-1))
+                
+                # print("p0_loss", p0_loss)
+                extra_loss.update({"p0_loss": p0_loss})
+
+
+                pS_loss = -((gist_weights * atten_mask[:,None,:,None] * gist_pool_idx[:,None,None,:]).sum(-1) + eps).log()
+                pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                # print("pS_loss", pS_loss)
+                extra_loss.update({"pS_loss": pS_loss})
+
+
+                # Entropy
+                sparsity_loss = -gist_weights * (gist_weights+eps).log()
+                sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                # print("sparsity_loss", sparsity_loss)
+                extra_loss.update({"sparsity_loss": sparsity_loss})
             
-            # print("p0_loss", p0_loss)
-            if p0_loss!=0:
-                extra_loss["p0_loss"].append(p0_loss.cpu())
-
-
-            gist_pool_idx[...,0] = 0
-            mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:].to(atten_mask.dtype))
-            # print("mask", mask, mask.shape)
-
-            pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
-            pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-
-            # print("pS_loss", pS_loss)
-            # if self.layer_idx>=4 and self.layer_idx<=11:
-            if pS_loss!=0:
-                extra_loss["pS_loss"].append(pS_loss.cpu())
-
-
-            # Entropy
-            sparsity_loss = -gist_weights * (gist_weights+eps).log()
-            sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-            # print("sparsity_loss", sparsity_loss)
-            if sparsity_loss!=0:
-                extra_loss["sparsity_loss"].append(sparsity_loss.cpu())
-        
-            # print(p0_loss, pS_loss, sparsity_loss)
+                # print(p0_loss, pS_loss, sparsity_loss)
 
 
 
@@ -241,7 +214,8 @@ class Edit_Qwen2SdpaAttention(Qwen2SdpaAttention):
 
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return attn_output, None, past_key_value, gist_pool, extra_loss
+
 
 
 
@@ -262,6 +236,8 @@ class Edit_Qwen2FlashAttention2(Qwen2FlashAttention2):
         self.n_layers = config.num_hidden_layers
         if layer_idx < self.n_layers//2:
             self.zero_gist_key.requires_grad = False
+        else:
+            self.zero_gist_key.requires_grad = True
 
 
     def forward(
@@ -271,7 +247,6 @@ class Edit_Qwen2FlashAttention2(Qwen2FlashAttention2):
         gist_pool: Optional[Dict[int, Dict]] = None, #[num_gist+1, num_key_value_head, head_dim]
         gist_idx_vector: Optional[torch.Tensor] = None, #[bsz, q_len]
         gist_pool_idx: Optional[torch.Tensor] = None, #[bsz, num_gist+1]
-        extra_loss: Optional[Dict[str, List]] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
@@ -289,28 +264,28 @@ class Edit_Qwen2FlashAttention2(Qwen2FlashAttention2):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-
-        for _,v in gist_pool.items():
-            v['keys'] = v['keys'].to(query_states.device)
-            v["values"] = v["values"].to(query_states.device)
+        gist_pool = copy.copy(gist_pool) # in favor of the gradient checkpointing
+        gist_pool['keys'] = gist_pool['keys'].to(query_states.device)
+        gist_pool["values"] = gist_pool["values"].to(query_states.device)
 
         # updating new gist
         if self.layer_idx >= self.n_layers//2 and gist_idx_vector.any().item():
+        # if gist_idx_vector.any().item():
             new_gist_keys = key_states.transpose(1,2)[gist_idx_vector]
             new_gist_values = value_states.transpose(1,2)[gist_idx_vector]                               
-            gist_pool[self.layer_idx]["keys"] = torch.concat([gist_pool[self.layer_idx]["keys"], new_gist_keys]).to(query_states.device)
-            gist_pool[self.layer_idx]["values"] = torch.concat([gist_pool[self.layer_idx]["values"], new_gist_values]).to(query_states.device)
+            gist_pool["keys"] = torch.concat([gist_pool["keys"], new_gist_keys]).to(query_states.device)
+            gist_pool["values"] = torch.concat([gist_pool["values"], new_gist_values]).to(query_states.device)
 
-        raw_gist_keys = gist_pool[self.layer_idx]["keys"]
-        raw_gist_values = gist_pool[self.layer_idx]["values"]   
+        raw_gist_keys = gist_pool["keys"]
+        raw_gist_values = gist_pool["values"]   
     
         # Add zero gist key and value
         zero_values = torch.zeros(1, self.num_key_value_heads, self.head_dim, device=query_states.device)
         gist_keys = torch.concat([self.zero_gist_key, raw_gist_keys]).to(query_states.dtype) # [num_gist+1,key_value_head,head_dim]
         gist_values = torch.concat([zero_values, raw_gist_values]).to(query_states.dtype)   
 
-
         causal_mask, atten_mask = attention_mask
+
 
         if position_embeddings is None:
             logger.warning_once(
@@ -383,75 +358,47 @@ class Edit_Qwen2FlashAttention2(Qwen2FlashAttention2):
             value_states = value_states.to(target_dtype)
 
 
-
-        # gist_keys = gist_keys.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1)
-        # gist_values = gist_values.repeat_interleave(self.num_key_value_groups, dim=1).transpose(0,1) 
-        # gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys.transpose(1, 2)) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
         num_gist = gist_keys.shape[0]
-        gist_keys = gist_keys[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1)
-        gist_values = gist_values[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1)
-        gist_keys = gist_keys.reshape(self.num_heads, self.head_dim, num_gist)
-        gist_values = gist_values.reshape(self.num_heads, num_gist, self.head_dim)
-        gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
-        
+        gist_keys = gist_keys[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1).reshape(num_gist, self.num_heads, self.head_dim)
+        gist_values = gist_values[:,:,None,:].expand(-1, -1, self.num_key_value_groups, -1).reshape(num_gist, self.num_heads, self.head_dim)
+        gist_logits = torch.matmul(query_states.to(gist_keys.dtype), gist_keys.permute(1, 2, 0)) / math.sqrt(self.head_dim) # [bsz, num_heads, q_len, num_gist]
+
+
+        if not self.training and self.layer_idx >= self.n_layers//2 and gist_keys.shape[0]>10:
+        # if not self.training:
+            gist_logits = gist_logits / 0.45
         gist_weights = nn.functional.softmax(gist_logits, dim=-1, dtype=torch.float32).to(query_states.dtype) # [bsz, num_heads, q_len, gist_num]
         gist_weights = nn.functional.dropout(gist_weights, p=self.attention_dropout, training=self.training)
         atten_mask = atten_mask.to(key_states.dtype).clone()
         atten_mask[reverse_cumsum(gist_idx_vector)>0] = 0
         gist_weights = gist_weights * atten_mask[:,None,:,None]
-        gist_output = torch.matmul(gist_weights, gist_values) # [bsz, num_heads, q_len, head_dim]
+        gist_output = torch.matmul(gist_weights, gist_values.permute(1, 0, 2)) # [bsz, num_heads, q_len, head_dim]
 
 
-
-        if not self.training:
-            eps = 1e-5
-            # Entropy
-            sparsity_loss = -gist_weights * (gist_weights+eps).log()
-            sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-            # print("sparsity_loss", sparsity_loss)
-            if extra_loss is not None:
-                # extra_loss["Entropy"].append(sparsity_loss)        
-                extra_loss["Entropy"].append((self.layer_idx, sparsity_loss))   
-    
-
-    
-
+        extra_loss = {}
         if self.training and gist_pool_idx is not None and self.layer_idx >= self.n_layers//2:
-            eps = 1e-5
+        # if self.training and gist_pool_idx is not None:   
+            with torch.no_grad():
+                eps = 1e-5
 
-            p0_loss = -(gist_weights[...,0] + eps).log()
-            p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                p0_loss = -(gist_weights[...,0] + eps).log()
+                p0_loss = ((p0_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                if torch.isnan(p0_loss).item():
+                    print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
+                    print("attention_mask", atten_mask, atten_mask.sum(-1))
+                extra_loss.update({"p0_loss": p0_loss})
 
-            if torch.isnan(p0_loss).item():
-                print("gist_weight with NAN", gist_weights, gist_weights.sum(-1), gist_weights.shape)
-                print("attention_mask", atten_mask, atten_mask.sum(-1))
+                pS_loss = -((gist_weights * atten_mask[:,None,:,None] * gist_pool_idx[:,None,None,:]).sum(-1) + eps).log()
+                pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                extra_loss.update({"pS_loss": pS_loss})
+
+                # Entropy
+                sparsity_loss = -gist_weights * (gist_weights+eps).log()
+                sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
+                # print("sparsity_loss", sparsity_loss)
+                extra_loss.update({"sparsity_loss": sparsity_loss})
             
-            # print("p0_loss", p0_loss)
-            if p0_loss!=0:
-                extra_loss["p0_loss"].append(p0_loss.cpu())
-
-
-            gist_pool_idx[...,0] = 0
-            mask = atten_mask[...,None].matmul(gist_pool_idx[:,None,:].to(atten_mask.dtype))
-            # print("mask", mask, mask.shape)
-
-            pS_loss = -((gist_weights * mask[:,None,:,:]).sum(-1) + eps).log()
-            pS_loss = ((pS_loss * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-
-            # print("pS_loss", pS_loss)
-            # if self.layer_idx>=4 and self.layer_idx<=11:
-            if pS_loss!=0:
-                extra_loss["pS_loss"].append(pS_loss.cpu())
-
-
-            # Entropy
-            sparsity_loss = -gist_weights * (gist_weights+eps).log()
-            sparsity_loss = ((sparsity_loss.sum(dim=-1) * atten_mask[:,None,:]).sum(-1) / (atten_mask[:,None,:].sum(-1) + eps)).mean()
-            # print("sparsity_loss", sparsity_loss)
-            if sparsity_loss!=0:
-                extra_loss["sparsity_loss"].append(sparsity_loss.cpu())
-        
-            # print(p0_loss, pS_loss, sparsity_loss)
+                # print(p0_loss, pS_loss, sparsity_loss)
 
 
 
@@ -481,18 +428,17 @@ class Edit_Qwen2FlashAttention2(Qwen2FlashAttention2):
             is_causal=self.is_causal,
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
-
+        attn_output = attn_output + gist_output.transpose(1,2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-
-        attn_output = attn_output + gist_output.reshape(bsz, q_len, self.hidden_size).contiguous()
 
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_value, gist_pool, extra_loss
     
+
 
 
 
@@ -503,14 +449,13 @@ Edit_QWEN2_ATTENTION_CLASSES = {
 
 
 
+
+
 class Edit_Qwen2DecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__(config, layer_idx)
-        # self.self_attn = Edit_Qwen2SdpaAttention(config=config, layer_idx=layer_idx)
-        # self.self_attn = Edit_Qwen2FlashAttention2(config=config, layer_idx=layer_idx)
         self.self_attn = Edit_QWEN2_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
-        # self.input_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.post_attention_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_idx = layer_idx
 
 
     def forward(
@@ -520,7 +465,6 @@ class Edit_Qwen2DecoderLayer(Qwen2DecoderLayer):
         gist_pool: Optional[Dict[int, torch.Tensor]] = None,
         gist_idx_vector: Optional[torch.Tensor] = None,    
         gist_pool_idx: Optional[torch.Tensor] = None,   
-        extra_loss: Optional[Dict[str, List]] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
@@ -556,13 +500,12 @@ class Edit_Qwen2DecoderLayer(Qwen2DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, gist_pool, extra_loss = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             gist_idx_vector=gist_idx_vector,
             gist_pool=gist_pool,
             gist_pool_idx=gist_pool_idx,
-            extra_loss=extra_loss,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -586,7 +529,7 @@ class Edit_Qwen2DecoderLayer(Qwen2DecoderLayer):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        return outputs, gist_pool, extra_loss
     
 
 
@@ -601,7 +544,6 @@ class Edit_Qwen2Model(Qwen2Model):
 
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
-        # self.norm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList([Edit_Qwen2DecoderLayer(config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)])
 
 
@@ -671,28 +613,15 @@ class Edit_Qwen2Model(Qwen2Model):
         #gist location boolean vector
         gist_idx_vector = (input_ids == gist_token_ids)
 
-        # print("position_ids", position_ids, position_ids.shape)
+        # print("origin position_ids", position_ids, sep="\n")
         # position_ids = alter_position_ids(gist_token_ids=gist_token_ids, input_ids=input_ids, origin_pos_ids=position_ids)
-        # print(position_ids)
+        # print("new_pos_ids", position_ids, sep="\n")
 
         # print("self.config._attn_implementation", self.config._attn_implementation)
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         ) # [bsz, 1, q_len, q_len]
         # print("causal_mask:", causal_mask, causal_mask.shape)
-
-        
-        # # if gist_idx_vector.any().item():
-        # col_segment = (reverse_cumsum(gist_idx_vector) > 0).to(inputs_embeds.dtype)
-        # # row_segment = ((gist_idx_vector.cumsum(-1).cumsum(-1) - 1) > 0).to(inputs_embeds.dtype)
-        # row_segment = col_segment.logical_not().to(inputs_embeds.dtype)
-        # mask1 = row_segment[...,None].matmul(col_segment[:,None,:])
-        # attention_mask = attention_mask.to(inputs_embeds.dtype)
-        # mask1[attention_mask[...,None].matmul(attention_mask[:,None,:]).logical_not()] = 0  # avoid changing the pad token value in causal mask 
-        # # print("gist_idx_vector", gist_idx_vector, gist_idx_vector.sum())
-        # # print("mask1", mask1, mask1.sum(), mask1.shape)
-        # causal_mask[mask1[:,None,...].to(torch.bool)] = torch.finfo(inputs_embeds.dtype).min
-        # # print("modified casual_mask", causal_mask, causal_mask.shape)
 
 
         hidden_states = inputs_embeds
@@ -705,19 +634,18 @@ class Edit_Qwen2Model(Qwen2Model):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                layer_outputs, gist_layer_pool, extra_loss_rnt = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    causal_mask,
-                    gist_idx_vector,
-                    gist_pool,
+                    (causal_mask, attention_mask),
+                    gist_pool[layer_idx],
+                    gist_idx_vector, 
                     gist_pool_idx,
-                    extra_loss,
                     position_ids,
                     past_key_values,
                     output_attentions,
@@ -726,13 +654,12 @@ class Edit_Qwen2Model(Qwen2Model):
                     position_embeddings,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs, gist_layer_pool, extra_loss_rnt = decoder_layer(
                     hidden_states,
                     attention_mask=(causal_mask, attention_mask),
                     gist_idx_vector=gist_idx_vector,
-                    gist_pool=gist_pool,
+                    gist_pool=gist_pool[layer_idx],
                     gist_pool_idx=gist_pool_idx,
-                    extra_loss=extra_loss,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
@@ -740,6 +667,13 @@ class Edit_Qwen2Model(Qwen2Model):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
+
+            gist_pool[layer_idx] = gist_layer_pool
+            if extra_loss is not None:
+                for k,v in extra_loss_rnt.items():
+                    if k not in extra_loss.keys():
+                        extra_loss.update({k:[]})
+                    extra_loss[k].append(v)
 
             hidden_states = layer_outputs[0]
 
@@ -770,76 +704,6 @@ class Edit_Qwen2Model(Qwen2Model):
 
 
 
-   # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
-            # if AttentionMaskConverter._ignore_causal_mask_sdpa(
-            #     attention_mask,
-            #     inputs_embeds=input_tensor,
-            #     past_key_values_length=past_seen_tokens,
-            #     is_training=self.training,
-            # ):
-            #     return None
-            pass
-
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        if using_static_cache:
-            target_length = past_key_values.get_max_length()
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            device=device,
-            min_dtype=min_dtype,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-        )
-
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
-            and not output_attentions
-        ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
-
-
 
 class Edit_Qwen2ForCausalLM(Qwen2ForCausalLM, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -847,8 +711,10 @@ class Edit_Qwen2ForCausalLM(Qwen2ForCausalLM, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = Edit_Qwen2Model(config)
-        self.gist_pool = None
-        self.gist_token_ids = config.vocab_size - 1
+        self.gist_pool = {}
+        for i in range(config.num_hidden_layers):
+            self.gist_pool.update({i:{"keys":torch.tensor([]), "values":torch.tensor([])}})
+        self.gist_token_ids = config.vocab_size + 1
         self.gist_pool_idx = None
 
 
@@ -859,11 +725,15 @@ class Edit_Qwen2ForCausalLM(Qwen2ForCausalLM, GenerationMixin):
         gist_pool: Optional[Dict[int, torch.Tensor]] = None,
         gist_token_ids: Optional[int] = None,
         gist_pool_idx: Optional[torch.Tensor] = None,
+        token_weights: Optional[torch.Tensor] = None,
+        teacher_input: Optional[torch.Tensor] = None,
+        teacher_weight: Optional[torch.Tensor] = None,
         extra_loss: Optional[Dict[str, List]] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        T_labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -933,29 +803,62 @@ class Edit_Qwen2ForCausalLM(Qwen2ForCausalLM, GenerationMixin):
             )
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         # TODO: remove the float() operation in v4.46
-        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
+        # print("lm_head", self.lm_head.weight)
 
         loss = None
-        if labels is not None:
-            # Upcast to float if we need to compute the loss to avoid potential precision issues
-            logits = logits.float()
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
+        logits = None
+
+        if self.training and (labels is not None):
+            shift_hidden_states = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_T_labels = T_labels[..., 1:].contiguous()
+            # shift_teacher_input = teacher_input[..., :-1, :].contiguous().to(hidden_states.device)
+
+            # flatten tokens
+            shift_hidden_states = shift_hidden_states.view(-1, self.config.hidden_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            shift_T_labels = shift_T_labels.view(-1)
+            # shift_teacher_input = shift_teacher_input.view(-1, self.config.hidden_size)
+
+            lce = LigerFusedLinearCrossEntropyLoss(reduction="none")
+            fused_kiv = LigerFusedLinearJSD(jsd_beta=0)
+
+            mask = (shift_labels != -100)
+            T_mask = (shift_T_labels != -100)
+
+            ce_loss = lce(lin_weight=self.lm_head.weight, _input=shift_hidden_states[T_mask], target=shift_labels[T_mask])        
+            klloss = fused_kiv(student_input=shift_hidden_states[T_mask], 
+                                student_weight=self.lm_head.weight, 
+                                teacher_input=teacher_input,
+                                teacher_weight=teacher_weight.to(hidden_states.device),
+                                shift_labels=None,
+                                )
+            w = token_weights if token_weights is not None else 1
+            # wce_loss = (ce_loss * w).mean()
+            wce_loss = (ce_loss * w).sum() / (w!=0).sum()
+            loss = wce_loss + klloss
+        else:
+            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+            if labels is not None:
+                # Upcast to float if we need to compute the loss to avoid potential precision issues
+                logits = logits.float()
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
-            loss=loss,
+            loss=(loss, ce_loss.mean(), wce_loss, klloss) if self.training and (labels is not None) else loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
