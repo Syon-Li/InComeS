@@ -3,7 +3,9 @@ This is the repository of the paper **InComeS: Integrating Compression and Selec
 
 
 ### Environments & Tools
-
+```
+CUDA version: 11.8
+```
 **Pip installation**
 ```
 conda create -y -n gist_env python=3.10
